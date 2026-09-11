@@ -3,7 +3,7 @@
  * Plugin Name: User Obscure
  * Plugin URI:  https://github.com/wp-awesome/user-obscure
  * Description: Removes the five surfaces through which WordPress hands out account names: the REST user listing, ?author=N probing, author archives, oEmbed author fields, and the login form's error message.
- * Version:     1.0.0
+ * Version:     2.0.0
  * Requires PHP: 8.1
  * License:     GPL-2.0-or-later
  *
@@ -19,9 +19,11 @@
  *
  * It would cost something, though, and the cost points the other way. The realistic failure of this
  * package is that it 401s or 404s a surface some site legitimately uses. An ordinary plugin can be
- * deactivated by the person who noticed, in the screen they noticed it in. A must-use plugin needs
- * shell access. When the likely failure is "I broke the editor", being deactivatable IS the safety
- * property, so this ships as a plugin and installs as a plugin:
+ * deactivated on the Plugins screen by the person who noticed. A must-use plugin needs shell access.
+ * When the likely failure is "I broke the editor", being deactivatable IS the safety property — and
+ * it is the only off switch here, which is deliberate: it is visible, it is logged, and it is
+ * obviously all-or-nothing rather than one surface quietly lapsing. So this ships as a plugin and
+ * installs as a plugin:
  *
  *     git submodule add https://github.com/wp-awesome/user-obscure \
  *         wp-content/plugins/user-obscure
@@ -30,10 +32,16 @@
  * that makes `site-access` need one applies to `mu-plugins/` alone.
  *
  * A host that wants it must-use anyway can `require` this file from a top-level mu-plugin stub. That
- * works and is supported: nothing here reads an option, calls `current_user_can()`, or consults a
- * filterable value at load. `wpuo_boot()` only registers callbacks, so the load position cannot
- * change what the package does. `tests/boot-test.php` proves it by fencing off the database and
- * booting.
+ * works and is supported: nothing here reads a stored value, calls `current_user_can()`, or consults
+ * a filterable value at load. `wpuo_boot()` only registers callbacks, so the load position cannot
+ * change what the package does. `tests/boot-test.php` proves it by fencing off the database for the
+ * whole process and booting.
+ *
+ * THERE IS NOTHING TO CONFIGURE FROM THE DASHBOARD, AND NO SCREEN SAYING SO. Two site-shape facts
+ * are declared as constants and documented in the README; the other three surfaces are simply on. A
+ * page whose only function is to tell an operator that the controls are elsewhere is a page that
+ * exists to disappoint, and a control whose every position but one degrades the thing it controls is
+ * an invitation to reach that position.
  */
 
 declare(strict_types=1);
@@ -52,11 +60,10 @@ require_once __DIR__ . '/src/load.php';
  * plugin that failed to load is silent. Memoizing also makes a second `require` harmless instead of
  * a second set of hooks.
  *
- * It lists HOOKS, not settings. Reading the settings here would mean reading the database at load,
- * which is the thing this package promises not to do; `wpuo_report()` answers that question on
- * demand, from inside a request.
+ * It lists HOOKS, and nothing else. What is in force is a different question with a different
+ * answer, and `wpuo_report()` answers it on demand from inside a request.
  *
- * @return array{hooks: string[], settings: bool}
+ * @return array{hooks: string[]}
  */
 function wpuo_boot(): array {
 	static $report = null;
@@ -80,14 +87,13 @@ function wpuo_boot(): array {
 	add_filter('shake_error_codes', 'wpuo_login_shake_codes', 10, 1);
 
 	$report = [
-		'hooks'    => [
+		'hooks' => [
 			'rest_pre_dispatch',
 			'parse_request',
 			'oembed_response_data',
 			'authenticate',
 			'shake_error_codes',
 		],
-		'settings' => is_admin() ? wpuo_settings_bootstrap() : false,
 	];
 
 	return $report;

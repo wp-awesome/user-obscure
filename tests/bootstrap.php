@@ -3,8 +3,14 @@
  * A WordPress-shaped test harness with no WordPress in it.
  *
  * Anything the package calls that this file does not define is a fatal error, which is the point: it
- * is how "loading this package touches no database" is proved rather than asserted. The surface
- * stubbed below is the complete list of what the package is allowed to depend on.
+ * is how "this package touches no database" is proved rather than asserted. The surface stubbed
+ * below is the complete list of what the package is allowed to depend on.
+ *
+ * THERE IS NO OPTIONS TABLE HERE AT ALL, AND THAT IS THE CENTRAL ASSERTION OF THE SUITE. This
+ * package once read four option rows. It reads none now, and the way that is proved is not a test
+ * somebody has to remember to write: `get_option()` and `update_option()` throw unconditionally, in
+ * every process, for the whole run. A stored value cannot silently disable a surface if no code path
+ * can reach a stored value without taking the suite down.
  */
 
 declare(strict_types=1);
@@ -14,21 +20,16 @@ if (! defined('ABSPATH')) {
 }
 
 /**
- * @param array<string, mixed> $options
- * @param string[]             $capabilities
+ * @param string[] $capabilities
  */
-function wpuo_test_reset(array $options = [], array $capabilities = []): void {
+function wpuo_test_reset(array $capabilities = []): void {
 	$GLOBALS['wpuo_test'] = [
-		'options'         => $options,
-		'capabilities'    => $capabilities,
-		'is_admin'        => false,
-		'filters'         => [],
-		'actions'         => [],
-		'settings'        => [],
-		'settings_errors' => [],
-		'headers'         => [],
-		'nocache'         => 0,
-		'option_guard'    => false,
+		'capabilities' => $capabilities,
+		'is_admin'     => false,
+		'filters'      => [],
+		'actions'      => [],
+		'headers'      => [],
+		'nocache'      => 0,
 	];
 
 	$GLOBALS['wp_query'] = new WPUO_Test_Query();
@@ -128,24 +129,21 @@ class WPUO_Test_Request {
 	}
 }
 
+/**
+ * Defined only so that reading an option fails BY NAME rather than as "undefined function".
+ *
+ * The fence is permanent and unconditional. This package has no options, and a future change that
+ * reintroduces one cannot pass the suite by accident.
+ */
 function get_option(string $name, mixed $default = false): mixed {
-	if (true === $GLOBALS['wpuo_test']['option_guard']) {
-		throw new RuntimeException(sprintf('get_option(%s) was called while the database was fenced off', $name));
-	}
-
-	return array_key_exists($name, $GLOBALS['wpuo_test']['options'])
-		? $GLOBALS['wpuo_test']['options'][$name]
-		: $default;
+	throw new RuntimeException(sprintf(
+		'get_option(%s): this package reads no options, and a stored value must never be able to change what it does',
+		$name
+	));
 }
 
 function update_option(string $name, mixed $value): bool {
-	if (true === $GLOBALS['wpuo_test']['option_guard']) {
-		throw new RuntimeException(sprintf('update_option(%s) was called while the database was fenced off', $name));
-	}
-
-	$GLOBALS['wpuo_test']['options'][$name] = $value;
-
-	return true;
+	throw new RuntimeException(sprintf('update_option(%s): this package writes no options', $name));
 }
 
 function is_admin(): bool {
@@ -176,39 +174,30 @@ function nocache_headers(): void {
 	$GLOBALS['wpuo_test']['nocache']++;
 }
 
-function add_options_page(string $page_title, string $menu_title, string $capability, string $slug, callable $callback): void {
-	$GLOBALS['wpuo_test']['settings']['page'] = compact('page_title', 'menu_title', 'capability', 'slug');
+/**
+ * The source of one of this package's own files, for the structural assertions.
+ */
+function wpuo_test_source(string $file): string {
+	return (string) file_get_contents(dirname(__DIR__) . '/' . $file);
 }
 
-/** @param array<string, mixed> $args */
-function register_setting(string $group, string $option, array $args = []): void {
-	$GLOBALS['wpuo_test']['settings']['options'][$option] = ['group' => $group, 'args' => $args];
-}
+/**
+ * Every PHP file this package ships.
+ *
+ * Globbed rather than listed, so a file added later is covered by the structural assertions without
+ * anybody having to remember to add it — which is exactly how `src/settings.php` would come back.
+ *
+ * @return string[]
+ */
+function wpuo_test_sources(): array {
+	$files = array_merge(
+		glob(dirname(__DIR__) . '/*.php') ?: [],
+		glob(dirname(__DIR__) . '/src/*.php') ?: []
+	);
 
-function add_settings_error(string $setting, string $code, string $message, string $type = 'error'): void {
-	$GLOBALS['wpuo_test']['settings_errors'][] = compact('setting', 'code', 'message');
-}
+	sort($files);
 
-function settings_errors(string $setting = ''): void {
-}
-
-function settings_fields(string $group): void {
-}
-
-function submit_button(): void {
-	echo '<button type="submit">Save</button>';
-}
-
-function checked(mixed $checked, mixed $current = true, bool $display = true): string {
-	return $checked === $current ? " checked='checked'" : '';
-}
-
-function esc_html(string $text): string {
-	return htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
-}
-
-function esc_attr(string $text): string {
-	return htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
+	return array_map(static fn (string $path): string => str_replace(dirname(__DIR__) . '/', '', $path), $files);
 }
 
 // ---------------------------------------------------------------------------

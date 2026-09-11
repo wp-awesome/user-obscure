@@ -7,12 +7,13 @@
  * the login slug for an account id, and the archive's 200-versus-404 difference is a valid-username
  * oracle for anybody who already has a candidate list.
  *
- * THEY ARE SEPARATELY CONTROLLABLE ON PURPOSE, AND THEY ARE DIFFERENT KINDS OF DECISION. Nothing a
- * theme does depends on `?author=N` resolving — WordPress writes `/author/<slug>/` links, not that
- * form — so switching the probe off is an operator decision, reversible from the settings screen.
- * Whether the SITE USES author archives is a fact about the theme's templates and about URLs already
- * published and indexed. A site that genuinely uses them cannot 404 them, and nobody can check which
- * kind of site it is from the dashboard. That one is declared in code. See the README.
+ * THEY ARE ONE DECISION, NOT TWO, AND MAKING THEM TWO WAS A DEFECT. They were separately
+ * controllable once, and the pair that shipped as the default was `?author=1` redirecting to an
+ * archive that answered 404 — the slug handed over, and nothing served. The probe is now derived
+ * from the archive declaration: unused archives leave the probe nowhere to resolve to, so it 404s;
+ * used archives make the redirect correct core behaviour, so it is left alone. Whether the site uses
+ * author archives is a fact about the theme's templates and about URLs already published and
+ * indexed, nobody can check it from the dashboard, and so it is declared in code. See the README.
  *
  * BOTH BRANCHES 404 UNIFORMLY. A 404 for a real slug and a 404 for an invented one are the same
  * response, which is what removes the oracle. A 403, or a redirect to the home page, would leave the
@@ -53,7 +54,7 @@ function wpuo_author_request_verdict(array $query_vars): string {
 		}
 	}
 
-	if (isset($query_vars['author']) && wpuo_obscuring('author_probe')) {
+	if (isset($query_vars['author']) && wpuo_obscuring_author_probe()) {
 		$author = $query_vars['author'];
 
 		if (is_scalar($author) && 1 === preg_match('/^-?\d+$/', (string) $author)) {
@@ -71,7 +72,7 @@ function wpuo_author_request_verdict(array $query_vars): string {
  * and have not yet been rewritten by anything that runs during the main query.
  *
  * The dashboard is exempt: `wp-admin/edit.php?author=5` is how an administrator filters the posts
- * list, and 404ing it would break the screen this package's settings live next to.
+ * list, and 404ing it would break a screen that has nothing to do with this.
  *
  * @param mixed $wp
  */

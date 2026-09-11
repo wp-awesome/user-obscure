@@ -11,6 +11,11 @@
  * breaks the block editor's author panel, several plugins, and anything else that reads the route
  * while logged in. What is gated here is the ANSWER, per request, on capability.
  *
+ * GATED UNLESS THE HOST DECLARES OTHERWISE. The one site that legitimately needs an anonymous answer
+ * here is a headless or JS front end fetching bylines, which is a fact about how the site was built
+ * rather than a preference somebody should be flipping from a screen. That declaration lives in
+ * `src/surfaces.php`, defaults to gated, and takes an exact spelling to switch off.
+ *
  * WHY THE GATE IS `list_users` OR `edit_posts`, AND NOT `list_users` ALONE. `list_users` belongs to
  * administrators only; an Editor does not have it. The block editor's author selector is served to
  * anyone who can create content, and core permits it for them today through a request shape whose
@@ -60,11 +65,11 @@ function wpuo_rest_users_route(string $route): string {
  * route because of `edit_posts` and not merely because the test happened to grant `list_users`.
  * `deny` is the only verdict that changes the response.
  *
- * @return 'off'|'other-route'|'own-profile'|'capability'|'editorial'|'deny'
+ * @return 'declared-used'|'other-route'|'own-profile'|'capability'|'editorial'|'deny'
  */
 function wpuo_rest_users_verdict(string $route): string {
-	if (! wpuo_obscuring('rest_users')) {
-		return 'off';
+	if (! wpuo_obscuring_rest_users()) {
+		return 'declared-used';
 	}
 
 	$kind = wpuo_rest_users_route($route);

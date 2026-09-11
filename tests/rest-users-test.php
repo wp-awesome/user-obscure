@@ -1,6 +1,12 @@
 <?php
 /**
- * Surface 1: the REST user listing.
+ * Surface 1: the REST user listing, on a site that has declared nothing.
+ *
+ * OBSCURE IS THE DEFAULT DIRECTION HERE, AND IT IS THE ONLY SURFACE WHERE THE DEFAULT POINTS THAT
+ * WAY. Author archives default to `used` because 404ing a published URL is diffuse damage nobody
+ * notices; the REST user listing defaults to `unused` because the site that genuinely reads it
+ * anonymously is a headless or JS front end whose developer knows they built one, and whose failure
+ * is a 401 they will see within a minute of deploying.
  *
  * THE ASSERTIONS THAT MATTER MOST ARE THE ONES ABOUT WHAT IS *NOT* DENIED. Breaking the block editor
  * for an Editor is the most likely real-world regression this package can cause, and it is silent
@@ -15,13 +21,11 @@ require_once __DIR__ . '/bootstrap.php';
 
 require_once dirname(__DIR__) . '/src/load.php';
 
-const WPUO_REST_KEY = 'wp_user_obscure_rest_users';
-
 /**
  * @param string[] $capabilities
  */
-function wpuo_test_rest(string $route, array $capabilities = [], mixed $stored = '1'): string {
-	wpuo_test_reset([WPUO_REST_KEY => $stored], $capabilities);
+function wpuo_test_rest(string $route, array $capabilities = []): string {
+	wpuo_test_reset($capabilities);
 
 	return wpuo_rest_users_verdict($route);
 }
@@ -29,11 +33,20 @@ function wpuo_test_rest(string $route, array $capabilities = [], mixed $stored =
 /**
  * @param string[] $capabilities
  */
-function wpuo_test_dispatch(string $route, array $capabilities = [], mixed $stored = '1'): mixed {
-	wpuo_test_reset([WPUO_REST_KEY => $stored], $capabilities);
+function wpuo_test_dispatch(string $route, array $capabilities = []): mixed {
+	wpuo_test_reset($capabilities);
 
 	return wpuo_rest_users_pre_dispatch(null, null, new WPUO_Test_Request($route));
 }
+
+// --- the declaration this file runs under ---------------------------------
+//
+// Nothing is defined. That is the shape of a bare install, and it is obscured.
+
+wpuo_assert_false(defined('WP_USER_OBSCURE_REST_USERS'), 'this file runs on a site that declared nothing');
+wpuo_assert_same(WPUO_REST_USERS_UNUSED, wpuo_rest_users(), 'an absent declaration resolves to unused');
+wpuo_assert_true(wpuo_obscuring_rest_users(), 'so the REST user listing is obscured without anybody asking');
+wpuo_assert_true(wpuo_report()['rest_users'], 'and the report says so');
 
 // --- which routes are even in scope ---------------------------------------
 
@@ -46,24 +59,7 @@ wpuo_assert_same('', wpuo_rest_users_route('/wp/v2/users/16/application-password
 wpuo_assert_same('', wpuo_rest_users_route('/wp/v2/users/me/application-passwords'), 'including under /me');
 wpuo_assert_same('', wpuo_rest_users_route('/acme/v1/users'), 'another namespace is not the core users route');
 
-// --- switched off: nothing is touched, whoever is asking -------------------
-
-foreach ([[], ['edit_posts'], ['list_users']] as $caps) {
-	foreach (['/wp/v2/users', '/wp/v2/users/16', '/wp/v2/users/me'] as $route) {
-		wpuo_assert_same(
-			'off',
-			wpuo_test_rest($route, $caps, '0'),
-			sprintf('an unticked setting leaves %s untouched', $route)
-		);
-		wpuo_assert_same(
-			null,
-			wpuo_test_dispatch($route, $caps, '0'),
-			sprintf('and dispatch of %s is not short-circuited', $route)
-		);
-	}
-}
-
-// --- switched on: anonymous enumeration is refused -------------------------
+// --- anonymous enumeration is refused -------------------------------------
 
 wpuo_assert_same('deny', wpuo_test_rest('/wp/v2/users'), 'an anonymous listing is refused');
 wpuo_assert_same('deny', wpuo_test_rest('/wp/v2/users/16'), 'an anonymous single-user read is refused');
@@ -73,10 +69,12 @@ wpuo_assert_true(is_wp_error($error), 'the refusal short-circuits dispatch with 
 wpuo_assert_same('rest_user_cannot_view', $error->get_error_code(), 'under the code core uses for the same refusal');
 wpuo_assert_same(['status' => 401], $error->get_error_data(), 'as a 401, not an empty 200 that some client will cache');
 
-// --- switched on: the editor keeps working --------------------------------
+// --- the editor keeps working ---------------------------------------------
 //
 // `list_users` is an administrator capability. An Editor does not have it, and gating on it alone
-// would take the block editor's author panel away from every Editor on the site.
+// would take the block editor's author panel away from every Editor on the site. This was the single
+// most load-bearing exemption when the surface was optional, and it matters more now that nobody can
+// switch the surface off to get their editor back.
 
 wpuo_assert_same('capability', wpuo_test_rest('/wp/v2/users', ['list_users']), 'an administrator gets normal results');
 wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/users', ['list_users']), 'and their request is not short-circuited at all');
@@ -102,14 +100,14 @@ wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/posts'), 'with no response of 
 foreach (['user-obscure.php', 'src/rest-users.php'] as $source) {
 	wpuo_assert_not_contains(
 		"'rest_endpoints'",
-		(string) file_get_contents(dirname(__DIR__) . '/' . $source),
+		wpuo_test_source($source),
 		sprintf('%s gates the answer and never unregisters the route', $source)
 	);
 }
 
 // --- another plugin answered first ----------------------------------------
 
-wpuo_test_reset([WPUO_REST_KEY => '1']);
+wpuo_test_reset();
 $existing = new WP_Error('someone_elses_error', 'handled upstream');
 wpuo_assert_same(
 	$existing,
@@ -119,23 +117,19 @@ wpuo_assert_same(
 
 // --- a request object this package does not recognise ----------------------
 
-wpuo_test_reset([WPUO_REST_KEY => '1']);
+wpuo_test_reset();
 wpuo_assert_same(null, wpuo_rest_users_pre_dispatch(null, null, null), 'a missing request contributes nothing and does not raise');
 wpuo_assert_same(null, wpuo_rest_users_pre_dispatch(null, null, 'not an object'), 'a request that is not an object contributes nothing');
 wpuo_assert_same(null, wpuo_rest_users_pre_dispatch(null, null, new stdClass()), 'an object with no get_route() contributes nothing');
 wpuo_assert_same(null, wpuo_rest_users_pre_dispatch(null, null, new WPUO_Test_Request(['/wp/v2/users'])), 'a route that is not a string contributes nothing');
 
-// --- a malformed setting contributes nothing, both directions asserted -----
+// --- no stored value can reach this decision -------------------------------
+//
+// Four options named `wp_user_obscure_*` exist in at least one production database, all set to '1'.
+// They are inert. `get_option()` throws for the whole of this process, so every assertion above was
+// reached without one — and a build that started consulting a stored value would fail here rather
+// than quietly obey a row nobody remembers setting.
 
-foreach ([null, '', '0', 'on', 'true', ['1'], new stdClass()] as $bad) {
-	$stored = null === $bad ? '' : $bad;
-
-	wpuo_assert_same('off', wpuo_test_rest('/wp/v2/users', [], $stored), 'a malformed setting leaves anonymous listing alone');
-	wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/users', [], $stored), 'and produces no refusal');
-	wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/users', ['edit_posts'], $stored), 'and leaves the editor working');
-
-	// Not fail-open: the mechanism is still live and still refuses when it is actually switched on.
-	wpuo_assert_same('deny', wpuo_test_rest('/wp/v2/users'), 'and the refusal still works when the setting is valid');
-}
+wpuo_assert_same('deny', wpuo_test_rest('/wp/v2/users'), 'the refusal is reached with the database fenced off');
 
 wpuo_test_done('rest-users-test');

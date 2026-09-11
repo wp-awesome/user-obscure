@@ -11,6 +11,12 @@
  * valid response a consumer already handles, whereas an empty string is a value that renders as an
  * empty byline.
  *
+ * UNCONDITIONAL. There is nothing to switch on and nothing to switch off. What this costs is a
+ * byline in a third party's embed card, which is cosmetic; what it prevents is the login slug being
+ * handed to every consumer that asks. No site's correct configuration is the second one, so there is
+ * no question here worth asking an operator, and a control with one useful position is only a way to
+ * reach the other one by accident.
+ *
  * Kept to the JSON discovery response on purpose. The embed IFRAME's own markup is theme output and
  * is named in the README as a surface this package does not cover.
  */
@@ -34,10 +40,6 @@ if (! defined('ABSPATH')) {
  */
 function wpuo_oembed_strip_author(mixed $data): mixed {
 	if (! is_array($data)) {
-		return $data;
-	}
-
-	if (! wpuo_obscuring('oembed')) {
 		return $data;
 	}
 

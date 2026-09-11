@@ -13,6 +13,11 @@
  * consumer of `wp_authenticate()` also pass. Normalising the ERROR rather than the STRING flattens
  * all of them at once.
  *
+ * UNCONDITIONAL. What flattening costs is that somebody who mistypes their USERNAME is told the pair
+ * is wrong rather than which half of it — real, and small, and smaller than a username oracle that
+ * needs nothing but the form. There is no site for which the specific message is worth the oracle,
+ * so there is nothing here to switch off.
+ *
  * PRIORITY 40: after every core authenticator (20 for username and email, 30 for cookies) and before
  * `wp_authenticate_spam_check` at 99, whose `spammer_account` error is not in the set below and is
  * left to mean what it says.
@@ -57,10 +62,6 @@ function wpuo_login_identity_codes(): array {
  * @return mixed
  */
 function wpuo_login_normalize_error(mixed $user = null): mixed {
-	if (! wpuo_obscuring('login_errors')) {
-		return $user;
-	}
-
 	if (! is_wp_error($user)) {
 		return $user;
 	}
@@ -88,10 +89,6 @@ function wpuo_login_normalize_error(mixed $user = null): mixed {
  */
 function wpuo_login_shake_codes(mixed $codes = null): mixed {
 	if (! is_array($codes)) {
-		return $codes;
-	}
-
-	if (! wpuo_obscuring('login_errors')) {
 		return $codes;
 	}
 

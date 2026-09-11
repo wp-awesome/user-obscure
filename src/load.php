@@ -18,4 +18,3 @@ require_once __DIR__ . '/rest-users.php';
 require_once __DIR__ . '/author-requests.php';
 require_once __DIR__ . '/oembed.php';
 require_once __DIR__ . '/login-errors.php';
-require_once __DIR__ . '/settings.php';
