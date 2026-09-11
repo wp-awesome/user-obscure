@@ -31,12 +31,16 @@ function wpuo_test_rest(string $route, array $capabilities = []): string {
 }
 
 /**
+ * The decision as the route's permission callback answers it, with no callback underneath.
+ *
+ * `true` is what a permitted request gets — not `null`, which core reads as a denial.
+ *
  * @param string[] $capabilities
  */
-function wpuo_test_dispatch(string $route, array $capabilities = []): mixed {
+function wpuo_test_permission(string $route, array $capabilities = [], mixed $inner = null): mixed {
 	wpuo_test_reset($capabilities);
 
-	return wpuo_rest_users_pre_dispatch(null, null, new WPUO_Test_Request($route));
+	return wpuo_rest_users_permit($inner, new WPUO_Test_Request($route));
 }
 
 // --- the declaration this file runs under ---------------------------------
@@ -46,7 +50,11 @@ function wpuo_test_dispatch(string $route, array $capabilities = []): mixed {
 wpuo_assert_false(defined('WP_USER_OBSCURE_REST_USERS'), 'this file runs on a site that declared nothing');
 wpuo_assert_same(WPUO_REST_USERS_UNUSED, wpuo_rest_users(), 'an absent declaration resolves to unused');
 wpuo_assert_true(wpuo_obscuring_rest_users(), 'so the REST user listing is obscured without anybody asking');
-wpuo_assert_true(wpuo_report()['rest_users'], 'and the report says so');
+// AND THE REPORT DOES NOT CLAIM MORE THAN IT KNOWS. This process has no REST server, so there is no
+// route table to read the decision off, and the honest answer is that it cannot tell. It used to
+// answer `true` here — meaning "we registered something" — which is what a production site's report
+// said while the endpoint served sixteen login slugs.
+wpuo_assert_same('unknown', wpuo_report()['rest_users'], 'and the report declines to claim enforcement it cannot see');
 
 // --- which routes are even in scope ---------------------------------------
 
@@ -64,8 +72,8 @@ wpuo_assert_same('', wpuo_rest_users_route('/acme/v1/users'), 'another namespace
 wpuo_assert_same('deny', wpuo_test_rest('/wp/v2/users'), 'an anonymous listing is refused');
 wpuo_assert_same('deny', wpuo_test_rest('/wp/v2/users/16'), 'an anonymous single-user read is refused');
 
-$error = wpuo_test_dispatch('/wp/v2/users');
-wpuo_assert_true(is_wp_error($error), 'the refusal short-circuits dispatch with an error');
+$error = wpuo_test_permission('/wp/v2/users');
+wpuo_assert_true(is_wp_error($error), 'the refusal is the permission callback\'s own answer');
 wpuo_assert_same('rest_user_cannot_view', $error->get_error_code(), 'under the code core uses for the same refusal');
 wpuo_assert_same(['status' => 401], $error->get_error_data(), 'as a 401, not an empty 200 that some client will cache');
 
@@ -77,51 +85,162 @@ wpuo_assert_same(['status' => 401], $error->get_error_data(), 'as a 401, not an 
 // switch the surface off to get their editor back.
 
 wpuo_assert_same('capability', wpuo_test_rest('/wp/v2/users', ['list_users']), 'an administrator gets normal results');
-wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/users', ['list_users']), 'and their request is not short-circuited at all');
-wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/users/16', ['list_users']), 'including a single-user read');
+wpuo_assert_same(true, wpuo_test_permission('/wp/v2/users', ['list_users']), 'and their request is permitted');
+wpuo_assert_same(true, wpuo_test_permission('/wp/v2/users/16', ['list_users']), 'including a single-user read');
 
 wpuo_assert_same('editorial', wpuo_test_rest('/wp/v2/users', ['edit_posts']), 'an Editor without list_users still gets the author list');
-wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/users', ['edit_posts']), 'and their request is not short-circuited');
-wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/users/16', ['edit_posts']), 'including a single-user read');
+wpuo_assert_same(true, wpuo_test_permission('/wp/v2/users', ['edit_posts']), 'and their request is permitted');
+wpuo_assert_same(true, wpuo_test_permission('/wp/v2/users/16', ['edit_posts']), 'including a single-user read');
 
 wpuo_assert_same('own-profile', wpuo_test_rest('/wp/v2/users/me', []), 'reading your own profile enumerates nobody and is never refused');
-wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/users/me', []), 'so a Subscriber keeps the dashboard and the editor');
+wpuo_assert_same(true, wpuo_test_permission('/wp/v2/users/me', []), 'so a Subscriber keeps the dashboard and the editor');
 
 wpuo_assert_same('other-route', wpuo_test_rest('/wp/v2/posts'), 'every other route is passed through');
-wpuo_assert_same(null, wpuo_test_dispatch('/wp/v2/posts'), 'with no response of this package\'s making');
+wpuo_assert_same(true, wpuo_test_permission('/wp/v2/posts'), 'with no refusal of this package\'s making');
 
-// --- the route is never removed -------------------------------------------
+// --- which registered routes are wrapped, and what is left alone -----------
 //
-// Only the answer is gated. Nothing in this package touches `rest_endpoints`, which is the common
-// recipe and the one that breaks Gutenberg.
-
-// The literal with its quotes, so this matches a hook REGISTRATION and not the prose above that
-// explains why there is none.
-foreach (['user-obscure.php', 'src/rest-users.php'] as $source) {
-	wpuo_assert_not_contains(
-		"'rest_endpoints'",
-		wpuo_test_source($source),
-		sprintf('%s gates the answer and never unregisters the route', $source)
-	);
-}
-
-// --- another plugin answered first ----------------------------------------
+// `rest_endpoints` is the hook the common recipe uses to REMOVE `/wp/v2/users`, which is what breaks
+// the block editor's author panel. This package uses the same hook to change one value on two
+// routes. The difference is not a matter of intent, so it is asserted: same route keys, same
+// handlers, same endpoint callbacks, same arguments, in the same order.
 
 wpuo_test_reset();
-$existing = new WP_Error('someone_elses_error', 'handled upstream');
+$before = wpuo_test_core_endpoints();
+$after  = wpuo_rest_users_endpoints($before);
+
+wpuo_assert_same(array_keys($before), array_keys($after), 'every route core registered is still registered, in the same order');
+
+$wrapped = [];
+
+foreach ($after as $pattern => $handlers) {
+	foreach ($handlers as $key => $handler) {
+		if (! is_numeric($key)) {
+			wpuo_assert_same($before[$pattern][$key], $handler, sprintf('%s keeps its route options untouched', $pattern));
+			continue;
+		}
+
+		wpuo_assert_same($before[$pattern][$key]['callback'], $handler['callback'], sprintf('%s keeps its endpoint callback', $pattern));
+		wpuo_assert_same($before[$pattern][$key]['methods'], $handler['methods'], sprintf('%s keeps its methods', $pattern));
+		wpuo_assert_same($before[$pattern][$key]['args'], $handler['args'], sprintf('%s keeps its arguments', $pattern));
+
+		if ($handler['permission_callback'] instanceof WPUO_Rest_Users_Permission) {
+			$wrapped[] = $pattern;
+			continue;
+		}
+
+		wpuo_assert_same(
+			$before[$pattern][$key]['permission_callback'],
+			$handler['permission_callback'],
+			sprintf('%s keeps the permission callback it had', $pattern)
+		);
+	}
+}
+
 wpuo_assert_same(
-	$existing,
-	wpuo_rest_users_pre_dispatch($existing, null, new WPUO_Test_Request('/wp/v2/users')),
-	'a response another plugin already produced is returned untouched, never replaced'
+	['/wp/v2/users', '/wp/v2/users/(?P<id>[\d]+)'],
+	$wrapped,
+	'exactly the collection and the single user are wrapped: not /me, not a sub-route, not another route'
+);
+
+// The registered key is a REGULAR EXPRESSION, not a path, and the group name in it has no promise
+// attached. Matching the shape rather than the spelling is what keeps a core rename from making this
+// package silently inert — the same failure this release exists to remove.
+
+wpuo_assert_same('collection', wpuo_rest_users_pattern('/wp/v2/users'), 'the collection pattern is recognised');
+wpuo_assert_same('single', wpuo_rest_users_pattern('/wp/v2/users/(?P<id>[\d]+)'), 'so is the single-user pattern core registers today');
+wpuo_assert_same('single', wpuo_rest_users_pattern('/wp/v2/users/(?P<user_id>[\d]+)'), 'and so is the same route with the group renamed');
+wpuo_assert_same('me', wpuo_rest_users_pattern('/wp/v2/users/me'), '/me is recognised and never wrapped');
+wpuo_assert_same('', wpuo_rest_users_pattern('/wp/v2/users/(?P<user_id>[\d]+)/application-passwords'), 'a deeper route is left to core');
+wpuo_assert_same('', wpuo_rest_users_pattern('/wp/v2/posts'), 'another route is not this package\'s business');
+
+// --- a route table this package does not recognise -------------------------
+
+wpuo_assert_same('not an array', wpuo_rest_users_endpoints('not an array'), 'a route table that is not an array is returned untouched');
+wpuo_assert_same([], wpuo_rest_users_endpoints([]), 'an empty one too');
+wpuo_assert_same(
+	['/wp/v2/users' => 'nonsense'],
+	wpuo_rest_users_endpoints(['/wp/v2/users' => 'nonsense']),
+	'and a handler list that is not a list is left alone rather than raising'
+);
+
+// --- WRAPS, NEVER REPLACES -------------------------------------------------
+//
+// Another plugin's rule on these routes may be STRICTER than this one. A wrapper that ignored it
+// would loosen a control somebody else installed, which is a worse defect than the one this release
+// fixes. So the inner callback is asked first, and its refusal is returned exactly as it gave it.
+
+$strict  = new WP_Error('someone_elses_error', 'handled upstream');
+$wrapper = new WPUO_Rest_Users_Permission(static fn (mixed $request): mixed => $strict);
+
+wpuo_test_reset(['list_users']);
+wpuo_assert_same(
+	$strict,
+	($wrapper)(new WPUO_Test_Request('/wp/v2/users')),
+	'another plugin\'s refusal is returned untouched, even for an administrator this package would permit'
+);
+
+wpuo_assert_same(
+	false,
+	wpuo_test_permission('/wp/v2/users', ['list_users'], static fn (mixed $request): bool => false),
+	'a plain false denial is returned untouched too'
+);
+
+wpuo_assert_same(
+	null,
+	wpuo_test_permission('/wp/v2/users', ['list_users'], static fn (mixed $request): mixed => null),
+	'and so is a null, which core reads as a denial'
+);
+
+// A permitted request reaches this package's gate, and a permitted request it does not deny keeps
+// the inner answer exactly as it was given.
+
+wpuo_assert_true(
+	is_wp_error(wpuo_test_permission('/wp/v2/users', [], static fn (mixed $request): bool => true)),
+	'a request the inner callback permitted is still refused to an anonymous caller'
+);
+
+wpuo_assert_same(
+	1,
+	wpuo_test_permission('/wp/v2/users', ['edit_posts'], static fn (mixed $request): mixed => 1),
+	'and when this package permits, the inner callback\'s own answer is what is returned'
+);
+
+$inner = static fn (mixed $request): mixed => $strict;
+wpuo_assert_same(
+	$inner,
+	(new WPUO_Rest_Users_Permission($inner))->inner,
+	'the wrapper KEEPS the callback it wrapped, rather than discarding it'
 );
 
 // --- a request object this package does not recognise ----------------------
+//
+// Only routes this package chose to wrap reach here, so this is defence in depth rather than a
+// reachable state. It fails the way the rest of the package does: by contributing nothing.
 
 wpuo_test_reset();
-wpuo_assert_same(null, wpuo_rest_users_pre_dispatch(null, null, null), 'a missing request contributes nothing and does not raise');
-wpuo_assert_same(null, wpuo_rest_users_pre_dispatch(null, null, 'not an object'), 'a request that is not an object contributes nothing');
-wpuo_assert_same(null, wpuo_rest_users_pre_dispatch(null, null, new stdClass()), 'an object with no get_route() contributes nothing');
-wpuo_assert_same(null, wpuo_rest_users_pre_dispatch(null, null, new WPUO_Test_Request(['/wp/v2/users'])), 'a route that is not a string contributes nothing');
+wpuo_assert_same(true, wpuo_rest_users_permit(null, null), 'a missing request contributes nothing and does not raise');
+wpuo_assert_same(true, wpuo_rest_users_permit(null, 'not an object'), 'a request that is not an object contributes nothing');
+wpuo_assert_same(true, wpuo_rest_users_permit(null, new stdClass()), 'an object with no get_route() contributes nothing');
+wpuo_assert_same(true, wpuo_rest_users_permit(null, new WPUO_Test_Request(['/wp/v2/users'])), 'a route that is not a string contributes nothing');
+wpuo_assert_same(true, wpuo_rest_users_permit('no_such_function_anywhere', new WPUO_Test_Request('/wp/v2/posts')), 'a permission callback that is not callable is not called');
+
+// --- the retired hook is GONE, not merely unused ---------------------------
+//
+// A consuming project pinned `remove_filter('rest_pre_dispatch', 'wpuo_rest_users_pre_dispatch')` as
+// its workaround. That call is now a no-op, and a no-op is exactly what this release must not be
+// quiet about. The function is removed rather than left in place unhooked, so `function_exists()`
+// answers honestly and nothing can re-attach a decision that no longer works.
+
+wpuo_assert_false(function_exists('wpuo_rest_users_pre_dispatch'), 'the rest_pre_dispatch callback no longer exists');
+
+foreach (['user-obscure.php', 'src/rest-users.php'] as $source) {
+	wpuo_assert_not_contains(
+		"add_filter('rest_pre_dispatch'",
+		wpuo_test_source($source),
+		sprintf('%s registers nothing on rest_pre_dispatch', $source)
+	);
+}
 
 // --- no stored value can reach this decision -------------------------------
 //

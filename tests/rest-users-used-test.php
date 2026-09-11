@@ -35,7 +35,7 @@ function wpuo_test_rest(string $route, array $capabilities = []): string {
 
 wpuo_assert_same(WPUO_REST_USERS_USED, wpuo_rest_users(), 'the host declared the REST user listing in use');
 wpuo_assert_false(wpuo_obscuring_rest_users(), 'so the surface contributes nothing');
-wpuo_assert_false(wpuo_report()['rest_users'], 'and the report says so');
+wpuo_assert_same('declared-used', wpuo_report()['rest_users'], 'and the report names the reason, rather than reporting a failure');
 
 // --- nothing is touched, whoever is asking --------------------------------
 
@@ -49,12 +49,22 @@ foreach ([[], ['edit_posts'], ['list_users']] as $caps) {
 
 		wpuo_test_reset($caps);
 		wpuo_assert_same(
-			null,
-			wpuo_rest_users_pre_dispatch(null, null, new WPUO_Test_Request($route)),
-			sprintf('and dispatch of %s is not short-circuited', $route)
+			true,
+			wpuo_rest_users_permit(null, new WPUO_Test_Request($route)),
+			sprintf('and a request for %s is permitted', $route)
 		);
 	}
 }
+
+// --- and the route table is not touched at all ----------------------------
+//
+// Not "wrapped with a wrapper that permits" — not touched. A site that declared this surface in use
+// carries no callback of this package's on any REST route, so there is nothing of ours left to
+// interact with whatever its front end does.
+
+wpuo_test_reset();
+$endpoints = wpuo_test_core_endpoints();
+wpuo_assert_same($endpoints, wpuo_rest_users_endpoints($endpoints), 'the route table comes back exactly as it went in');
 
 // --- the declaration is read from code, never from a database -------------
 

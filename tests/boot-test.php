@@ -49,7 +49,7 @@ $registered = array_merge(wpuo_test_get('filters'), wpuo_test_get('actions'));
 
 wpuo_assert_same(
 	[
-		'rest_pre_dispatch',
+		'rest_endpoints',
 		'parse_request',
 		'oembed_response_data',
 		'authenticate',
@@ -85,6 +85,14 @@ $priorities = array_column($registered, 'priority', 'hook');
 // `wp_authenticate_spam_check` at 99, whose error is not an identity leak and keeps its meaning.
 wpuo_assert_same(40, $priorities['authenticate'], 'the login filter runs after core authenticates and before the spam check');
 
+// THE DEFAULT, AND DELIBERATELY NOT A LATE ONE. Surface 1 used to sit on `rest_pre_dispatch`, where a
+// plugin that forgot to return threw its refusal away, and where the tempting repair is to register
+// later and win. Position is not what makes the decision hold now: a permission callback has no
+// return value for a later callback to discard. A plugin that REPLACES the callback outright can
+// still make this package inert, and the answer to that is not a priority race either — it is
+// `wpuo_report()`, which reads the live route table and says `not-in-force` when that has happened.
+wpuo_assert_same(10, $priorities['rest_endpoints'], 'surface 1 claims no special position, because it does not need one');
+
 // --- booting twice is harmless ---------------------------------------------
 
 $before = count(wpuo_test_hooked());
@@ -97,10 +105,15 @@ wpuo_assert_same($before, count(wpuo_test_hooked()), 'and a second boot register
 // unconditional surfaces on, REST users obscured because obscure is the default direction, and the
 // author pair off because author archives are presumed in use until somebody says otherwise.
 
-wpuo_test_reset();
+// It is read here WITHOUT a reset, because two of its keys now report what is attached rather than
+// what was intended, and clearing the hooks would be clearing the thing under test.
+
+wpuo_test_caps([]);
+wpuo_test_rest_server_up();
+
 wpuo_assert_same(
 	[
-		'rest_users'      => true,
+		'rest_users'      => 'in-force',
 		'author_probe'    => false,
 		'author_archives' => 'used',
 		'oembed'          => true,
@@ -109,6 +122,19 @@ wpuo_assert_same(
 	wpuo_report(),
 	'a host that declares nothing gets the default posture, read without touching a database'
 );
+
+// --- and the report can say no --------------------------------------------
+//
+// THE KEYS THAT REPORT ATTACHMENT MUST BE ABLE TO REPORT ITS ABSENCE. A report that answers `true`
+// in every state is not evidence of anything, which is precisely how a production site came to be
+// described as protected while its REST user listing served sixteen login slugs.
+
+wpuo_test_rest_server_down();
+wpuo_assert_same('unknown', wpuo_report()['rest_users'], 'with no REST server to read, the report says it cannot tell');
+
+wpuo_test_reset();
+wpuo_assert_false(wpuo_report()['oembed'], 'with nothing attached, the oEmbed key says so rather than claiming success');
+wpuo_assert_false(wpuo_report()['login_errors'], 'and so does the login key');
 
 // --- NOT FAIL-OPEN: the registered callbacks are the real ones -------------
 
@@ -177,7 +203,13 @@ foreach ($sources as $source) {
 	}
 }
 
-foreach (['wpuo_settings_bootstrap', 'wpuo_settings_register', 'wpuo_settings_menu', 'wpuo_settings_render_page', 'wpuo_sanitize_toggle', 'wpuo_stored', 'wpuo_stored_is_readable', 'wpuo_surfaces', 'wpuo_obscuring', 'wpuo_option_key'] as $gone) {
+// `wpuo_rest_users_pre_dispatch` is in this list from 3.0.0. It was surface 1's decision until a
+// consuming project measured it being discarded by the next callback on `rest_pre_dispatch`, and it
+// is REMOVED rather than left in place unhooked: a function that still exists invites somebody to
+// re-attach it, and a consuming project's `remove_filter()` workaround is better answered by a name
+// that is honestly gone than by one that is present and inert.
+
+foreach (['wpuo_rest_users_pre_dispatch', 'wpuo_settings_bootstrap', 'wpuo_settings_register', 'wpuo_settings_menu', 'wpuo_settings_render_page', 'wpuo_sanitize_toggle', 'wpuo_stored', 'wpuo_stored_is_readable', 'wpuo_surfaces', 'wpuo_obscuring', 'wpuo_option_key'] as $gone) {
 	wpuo_assert_false(function_exists($gone), sprintf('%s() no longer exists', $gone));
 }
 

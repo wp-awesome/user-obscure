@@ -104,18 +104,33 @@ function wpuo_obscuring_rest_users(): bool {
 /**
  * What is in force, for a consuming project's own test suite.
  *
- * Kept in the shape it had when four of these were settings, because three projects consume it. Two
- * of the five are now constant `true`, and the author pair is bound: `author_probe` is `true` if and
- * only if `author_archives` is `unused`.
+ * REGISTERED IS NOT IN FORCE, AND THIS REPORT ONCE CONFLATED THEM. `rest_users` was a boolean
+ * meaning "this package intends to obscure the listing". On a consuming project's production site it
+ * was `true` while `/wp-json/wp/v2/users` served sixteen login slugs, because a third-party filter
+ * discarded the refusal after it was built. The report was not wrong about anything it actually
+ * knew. It reported an intention and was read as a guarantee — the same false clean bill of health
+ * as a blocked-IP report that cannot read its own log.
  *
- * @return array{rest_users: bool, author_probe: bool, author_archives: string, oembed: bool, login_errors: bool}
+ * So `rest_users` no longer answers "did we register". It answers "is this package's decision on the
+ * route the REST server will serve", by reading the route table back after every other plugin has
+ * filtered it — or `unknown` when there is no REST server in this request to read, which is the
+ * honest answer outside one and must not be read as either success or failure.
+ *
+ * THE OTHER KEYS ARE NOT ENFORCEMENT CLAIMS AND MUST NOT BE READ AS ONE. `author_archives` and
+ * `author_probe` are DECLARATIONS: what this site said about its own shape. `oembed` and
+ * `login_errors` say only that the callback is attached right now, which catches a `remove_filter()`
+ * by something else and catches a package that never booted — it cannot catch a later callback
+ * throwing the result away, because a filter chain's future behaviour is not inspectable the way a
+ * route table is. The README says how to check those two from outside.
+ *
+ * @return array{rest_users: string, author_probe: bool, author_archives: string, oembed: bool, login_errors: bool}
  */
 function wpuo_report(): array {
 	return [
-		'rest_users'      => wpuo_obscuring_rest_users(),
+		'rest_users'      => wpuo_rest_users_enforcement(),
 		'author_probe'    => wpuo_obscuring_author_probe(),
 		'author_archives' => wpuo_author_archives(),
-		'oembed'          => true,
-		'login_errors'    => true,
+		'oembed'          => has_filter('oembed_response_data', 'wpuo_oembed_strip_author'),
+		'login_errors'    => has_filter('authenticate', 'wpuo_login_normalize_error'),
 	];
 }

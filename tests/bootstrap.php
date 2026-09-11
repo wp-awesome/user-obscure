@@ -33,7 +33,20 @@ function wpuo_test_reset(array $capabilities = []): void {
 	];
 
 	$GLOBALS['wp_query'] = new WPUO_Test_Query();
-	unset($GLOBALS['wpuo_author_404']);
+	unset($GLOBALS['wpuo_author_404'], $GLOBALS['wp_rest_server']);
+}
+
+/**
+ * Sets the capabilities WITHOUT clearing the registration log.
+ *
+ * `wpuo_test_reset()` empties the hooks, which is what most files want. A file that dispatches a
+ * request through the filter chain cannot use it between requests: the chain under test is the one
+ * registered at boot, and boot is memoized, so clearing it would leave nothing to dispatch through.
+ *
+ * @param string[] $capabilities
+ */
+function wpuo_test_caps(array $capabilities): void {
+	$GLOBALS['wpuo_test']['capabilities'] = $capabilities;
 }
 
 function wpuo_test_set(string $key, mixed $value): void {
@@ -129,6 +142,131 @@ class WPUO_Test_Request {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The REST server, shaped like core's
+// ---------------------------------------------------------------------------
+
+/**
+ * What core's own permission check answers for an anonymous read of the user collection.
+ *
+ * IT ANSWERS YES, AND THAT IS THE LEAK. `WP_REST_Users_Controller::get_items_permissions_check()`
+ * requires `list_users` only for `context=edit`; a `context=view` listing is served to anybody. The
+ * harness has to model that faithfully, because a stub that denied anonymous reads would let a
+ * completely inert build pass every dispatch assertion below.
+ */
+function wpuo_test_core_users_permission(mixed $request): mixed {
+	return true;
+}
+
+function wpuo_test_core_serve(mixed $request): string {
+	return 'served';
+}
+
+/**
+ * The routes core registers under `/wp/v2/users`, in the shape `WP_REST_Server` holds them.
+ *
+ * Numeric keys are handlers; string keys are route options. Both are present here because a filter
+ * that mistakes a route option for a handler is a fatal on a real site.
+ *
+ * @return array<string, array<int|string, mixed>>
+ */
+function wpuo_test_core_endpoints(): array {
+	$handler = [
+		'methods'             => 'GET',
+		'callback'            => 'wpuo_test_core_serve',
+		'permission_callback' => 'wpuo_test_core_users_permission',
+		'args'                => [],
+	];
+
+	return [
+		'/wp/v2/users'                                          => ['namespace' => 'wp/v2', $handler],
+		'/wp/v2/users/(?P<id>[\d]+)'                            => ['namespace' => 'wp/v2', $handler],
+		'/wp/v2/users/me'                                       => ['namespace' => 'wp/v2', $handler],
+		'/wp/v2/users/(?P<user_id>[\d]+)/application-passwords' => ['namespace' => 'wp/v2', $handler],
+		'/wp/v2/posts'                                          => ['namespace' => 'wp/v2', $handler],
+	];
+}
+
+/**
+ * `WP_REST_Server`, stubbed down to the one method that matters here.
+ *
+ * `get_routes()` applies `rest_endpoints` to a fresh copy every time, as core does — which is why a
+ * wrapper installed by that filter cannot accumulate across calls.
+ */
+class WPUO_Test_Server {
+	/** @return array<string, array<int|string, mixed>> */
+	public function get_routes(): array {
+		return apply_filters('rest_endpoints', wpuo_test_core_endpoints());
+	}
+}
+
+/**
+ * Makes a REST server exist for this request, as `rest_get_server()` does on a real site.
+ */
+function wpuo_test_rest_server_up(): WPUO_Test_Server {
+	$GLOBALS['wp_rest_server'] = new WPUO_Test_Server();
+
+	return $GLOBALS['wp_rest_server'];
+}
+
+function wpuo_test_rest_server_down(): void {
+	unset($GLOBALS['wp_rest_server']);
+}
+
+/**
+ * Dispatches a request the way `WP_REST_Server::dispatch()` does, in the same order.
+ *
+ * `rest_pre_dispatch` first, where a non-null result short-circuits. Then the route table, filtered
+ * through `rest_endpoints` and matched as core matches it. Then the handler's `permission_callback`,
+ * read as core reads it: a `WP_Error` is the answer, and `false` or `null` becomes `rest_forbidden`.
+ *
+ * @param string[] $capabilities
+ *
+ * @return mixed 'served', or the WP_Error that stopped it
+ */
+function wpuo_test_rest_dispatch(string $route, array $capabilities = []): mixed {
+	wpuo_test_caps($capabilities);
+
+	$server  = $GLOBALS['wp_rest_server'] ?? new WPUO_Test_Server();
+	$request = new WPUO_Test_Request($route);
+
+	$pre = apply_filters('rest_pre_dispatch', null, $server, $request);
+
+	if (null !== $pre) {
+		return $pre;
+	}
+
+	foreach ($server->get_routes() as $pattern => $handlers) {
+		if (1 !== preg_match('@^' . $pattern . '$@i', $route)) {
+			continue;
+		}
+
+		foreach ($handlers as $key => $handler) {
+			if (! is_numeric($key)) {
+				continue;
+			}
+
+			$permission = $handler['permission_callback'] ?? null;
+
+			if (null !== $permission) {
+				$granted = ($permission)($request);
+
+				if (is_wp_error($granted)) {
+					return $granted;
+				}
+
+				if (false === $granted || null === $granted) {
+					return new WP_Error('rest_forbidden', 'Sorry, you are not allowed to do that.', ['status' => 401]);
+				}
+			}
+
+			return ($handler['callback'])($request);
+		}
+	}
+
+	return new WP_Error('rest_no_route', 'No route was found matching the URL and request method.', ['status' => 404]);
+}
+
 /**
  * Defined only so that reading an option fails BY NAME rather than as "undefined function".
  *
@@ -155,11 +293,55 @@ function current_user_can(string $capability): bool {
 }
 
 function add_action(string $hook, callable $callback, int $priority = 10, int $accepted_args = 1): void {
-	$GLOBALS['wpuo_test']['actions'][] = compact('hook', 'callback', 'priority');
+	$GLOBALS['wpuo_test']['actions'][] = compact('hook', 'callback', 'priority', 'accepted_args');
 }
 
 function add_filter(string $hook, callable $callback, int $priority = 10, int $accepted_args = 1): void {
-	$GLOBALS['wpuo_test']['filters'][] = compact('hook', 'callback', 'priority');
+	$GLOBALS['wpuo_test']['filters'][] = compact('hook', 'callback', 'priority', 'accepted_args');
+}
+
+/**
+ * A REAL filter chain, because the defect this suite now covers lives in the chain, not in a
+ * callback.
+ *
+ * A harness whose `add_filter()` only logs can prove that a callback was attached and that it
+ * returns the right thing when called directly. That is exactly the evidence a production site
+ * produced while serving sixteen login slugs: attached, right priority, right argument count, right
+ * `WP_Error` — and the next callback in the chain threw the error away. No assertion about a
+ * callback can catch that. Only running the chain can.
+ *
+ * Priority order, then registration order within a priority, as WordPress does it.
+ */
+function apply_filters(string $hook, mixed $value, mixed ...$args): mixed {
+	$chain = [];
+
+	foreach (array_merge($GLOBALS['wpuo_test']['filters'], $GLOBALS['wpuo_test']['actions']) as $index => $entry) {
+		if ($hook !== $entry['hook']) {
+			continue;
+		}
+
+		$chain[] = $entry + ['index' => $index];
+	}
+
+	usort($chain, static fn (array $a, array $b): int => [$a['priority'], $a['index']] <=> [$b['priority'], $b['index']]);
+
+	foreach ($chain as $entry) {
+		$accepted = max(1, (int) ($entry['accepted_args'] ?? 1));
+		$passed   = array_slice(array_merge([$value], $args), 0, $accepted);
+		$value    = ($entry['callback'])(...$passed);
+	}
+
+	return $value;
+}
+
+function has_filter(string $hook, callable|string $callback): bool {
+	foreach (array_merge($GLOBALS['wpuo_test']['filters'], $GLOBALS['wpuo_test']['actions']) as $entry) {
+		if ($hook === $entry['hook'] && $callback === $entry['callback']) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 function __return_false(): bool {

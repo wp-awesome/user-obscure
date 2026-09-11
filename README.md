@@ -60,7 +60,7 @@ author archive, just the form every WordPress site has.
 
 | # | Surface | Where it is answered | How it is decided |
 | --- | --- | --- | --- |
-| 1 | `/wp-json/wp/v2/users` | `rest_pre_dispatch` | **constant**, closed by default |
+| 1 | `/wp-json/wp/v2/users` | the route's own `permission_callback`, wrapped via `rest_endpoints` | **constant**, closed by default |
 | 2 | `/?author=N` | `parse_request` → `template_redirect` | **derived** from 3 |
 | 3 | `/author/<slug>/` | `parse_request` → `template_redirect` | **constant**, open by default |
 | 4 | `/wp-json/oembed/1.0/embed` | `oembed_response_data` | always closed |
@@ -72,6 +72,74 @@ author archive, just the form every WordPress site has.
 breaks the block editor's author panel, several plugins, and anything else that reads the route while
 logged in. What is gated here is the *answer*, per request, on capability. Deny is a 401 with core's
 own `rest_user_cannot_view` code — not an empty `200`, which is a lie some client will cache.
+
+#### Why this is a permission callback, and must not be "simplified" back to `rest_pre_dispatch`
+
+Until 3.0.0 the decision was a `rest_pre_dispatch` callback. **On a production site running ACF Pro
+it was completely inert**, and every check short of fetching the endpoint said it was working.
+Measured by the consuming project that found it:
+
+```
+callback attached                         prio=10 args=3  (correct)
+wpuo_rest_users_pre_dispatch(...) direct  WP_Error(rest_user_cannot_view)
+apply_filters('rest_pre_dispatch', ...)   NULL
+live GET /wp-json/wp/v2/users             200, all 16 slugs
+```
+
+ACF Pro hooks that filter and treats it as an action —
+`advanced-custom-fields-pro/includes/rest-api/class-acf-rest-api.php:22`:
+
+```php
+add_filter( 'rest_pre_dispatch', array( $this, 'initialize' ), 10, 3 );
+
+public function initialize( $response, $handler, $request ) {
+    if ( ! acf_get_setting( 'rest_api_enabled' ) ) { return; }   // bare return, still null
+    // ...no return statement on any path
+}
+```
+
+PHP returns `null` implicitly, so the refusal this plugin had just built was discarded one callback
+later. **Turning ACF's REST integration off is not a workaround** — the early return is bare too, so
+the disabled path clobbers exactly like the enabled one.
+
+**The hazard is the filter contract, not ACF.** `rest_pre_dispatch` is a filter, and any callback on
+it that forgets to return throws away whatever the previous one produced. You cannot audit an
+ecosystem for that. A second consuming project went looking in their own plugin inventory and found
+the same shape from a different vendor — Gravity Forms,
+`class-gf-rest-authentication.php:840`:
+
+```php
+return rest_handle_options_request( null, $server, $request );
+```
+
+Core returns its *first* argument unchanged when the method is not OPTIONS, and Gravity Forms passes
+`null` there rather than the value it was handed. On a GET, that path returns `null` and any prior
+`WP_Error` is gone. Narrower than ACF's — it is only reachable for a caller authenticated with a
+Gravity Forms API key, so it is not an anonymous exposure — but it is the same discard, reached from
+a completely different direction. **Moving off the hook retires that one too, without Gravity Forms
+being fixed.**
+
+**This is not "plugins on this filter are dangerous".** The same inventory found WPML's
+`replace_shortcode_in_rest_request` on `rest_pre_dispatch` at `PHP_INT_MAX`, and it is *correct*: one
+terminal `return $result`, with the body-rewriting branch mutating the request and falling through to
+that same return. It is registered for visitors and subscribers, so it is in the chain of an
+anonymous request, and an error passed to it comes out the other side intact. The defect is
+specifically **a path with no return**.
+
+So the decision moved to the place core provides for deciding whether a request may be answered: the
+route's `permission_callback`. **A permission callback has no return value for a careless third party
+to discard.** It is asked, per request, and the answer it gives is the answer. Registering later on
+the old hook would merely have won a race — one that holds until the next plugin registers at the
+same priority, and that is not a property worth depending on.
+
+**The existing callback is wrapped, never replaced.** Core's own check runs first and its refusal is
+returned exactly as it gave it, so another plugin's stricter rule on those routes is not loosened by
+this one. Only a request that was already going to be permitted reaches the capability gate here.
+Both routes the reporter confirmed are covered: the collection, and `/wp/v2/users/<id>`.
+
+One failure mode remains and it is *reported* rather than tolerated: another plugin can **replace**
+the permission callback on those routes from a later `rest_endpoints` filter. See
+[Checking that it is actually in force](#checking-that-it-is-actually-in-force).
 
 The gate is `list_users` **or** `edit_posts`, and the second half is not a weakening. `list_users` is
 an administrator capability; an Editor does not have it. Gating on `list_users` alone takes the
@@ -231,6 +299,95 @@ not allowed to take down. No array is cast to a string, no undeclared constant i
 is assumed to have the method it normally has. A malformed anything costs this plugin its effect,
 never the site its availability — and never a blanket denial that breaks the editor.
 
+## Checking that it is actually in force
+
+**Registered is not in force, and only one of those is worth knowing.** On the site above, every
+check that inspected this plugin said it was working. The callback was attached, at the right
+priority, with the right argument count, and calling it directly produced the right `WP_Error`. The
+endpoint served sixteen login slugs. Any check that asks *"did we register?"* would have passed that
+day, and so would any report built on the answer.
+
+So `wpuo_report()['rest_users']` no longer answers that question. It reads the route table back out
+of the REST server, after every plugin's `rest_endpoints` filter has had it, and answers one of:
+
+| value | means |
+| --- | --- |
+| `in-force` | this plugin's decision is on both users routes, as the server will serve them |
+| `not-in-force` | it is not — something replaced the permission callback, and the listing is open |
+| `unknown` | there is no REST server in this request, so it cannot be read. **Not a pass.** |
+| `declared-used` | `WP_USER_OBSCURE_REST_USERS = 'used'`, so nothing is gated here by design |
+
+It never *builds* a server to find out, because `rest_get_server()` fires `rest_api_init`, and a
+report has no business causing that on an ordinary page load. From WP-CLI, build one yourself first:
+
+```sh
+wp eval 'rest_get_server(); echo wpuo_report()["rest_users"], "\n";'
+```
+
+**Then check it from outside, logged out, which is the only check that proves anything:**
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' https://example.com/wp-json/wp/v2/users
+# 401 — anything else, read on
+```
+
+**A `200 []` is not evidence of safety.** An unprotected collection returns an empty array when no
+user has published content, which is indistinguishable from a working denial. The project that
+reported the ACF interaction had exactly that: their preview environment looked clean because no
+preview user had published anything, while production — where 4 of 16 users held published posts —
+returned all sixteen slugs. **Check on the environment where users actually hold content**, or you
+are reading an empty set wearing a denial's clothes.
+
+If you are still on 2.x, this is the check that detects the clobber on that version:
+
+```sh
+wp eval '$r=new WP_REST_Request("GET","/wp/v2/users"); echo is_wp_error(apply_filters("rest_pre_dispatch",null,null,$r)) ? "protected" : "CLOBBERED";'
+```
+
+**On 3.0.0 that snippet prints `CLOBBERED` on every site, and it means nothing.** This plugin no
+longer puts anything on `rest_pre_dispatch`; that line measures a hook it has left. Use the two
+checks above instead.
+
+The other report keys are weaker claims and must not be read as this one. `author_archives` and
+`author_probe` are **declarations** — what the site said about its own shape. `oembed` and
+`login_errors` say only that the callback is attached right now, which catches a `remove_filter()` by
+something else and catches a plugin that never booted; neither catches a later callback throwing the
+result away, because a filter chain's future behaviour is not inspectable the way a route table is.
+Check those two from outside as well:
+
+```sh
+curl -s 'https://example.com/wp-json/oembed/1.0/embed?url=https://example.com/' | grep -c author_name
+# 0
+```
+
+## Upgrading to 3.0.0
+
+**Breaking, and deliberately loud.** Surface 1 moved off `rest_pre_dispatch`, for the reason given
+under surface 1 above. Three things change for anything that consumes this plugin:
+
+- **`wpuo_rest_users_pre_dispatch()` is gone.** If you carried
+  `remove_filter('rest_pre_dispatch', 'wpuo_rest_users_pre_dispatch')` as a workaround for the ACF
+  interaction, **that call is now a silent no-op** — `remove_filter()` returns `false` for a callback
+  that was never attached, and says nothing. Delete it. The function is removed rather than left in
+  place unhooked, so `function_exists()` answers honestly and nobody can re-attach a decision that no
+  longer works. If that workaround was load-bearing on your site, **the listing was open the whole
+  time it was in place** — check it from outside before you assume otherwise.
+- **`wpuo_boot()['hooks']` lists `rest_endpoints` where it listed `rest_pre_dispatch`.** A test that
+  pins that array fails by name, which is the intended way to find out.
+- **`wpuo_report()['rest_users']` is a string, not a boolean.** `true`/`false` could not tell a
+  registration from an enforcement, and that distinction is the whole of this release. A consumer
+  asserting `=== true` now fails loudly instead of continuing to believe a report that was wrong on a
+  production site. See [Checking that it is actually in force](#checking-that-it-is-actually-in-force).
+
+`wpuo_report()['oembed']` and `['login_errors']` keep their type. They were the literal `true`; they
+now report whether the callback is attached, so they can answer `false` — in a process where this
+plugin never booted, they now say so instead of claiming success.
+
+The capability rule is **unchanged**: `list_users` **or** `edit_posts`. Gating on `list_users` alone
+would take the block editor's author panel away from every Editor, and that remains the most likely
+real-world regression this plugin could cause. The `WP_Error` code and the 401 status are unchanged
+too, so anything pinning on `rest_user_cannot_view` keeps working.
+
 ## Upgrading from the version with a settings page
 
 **Four options may exist in your database**, named `wp_user_obscure_rest_users`,
@@ -252,12 +409,13 @@ wp option delete wp_user_obscure_oembed
 wp option delete wp_user_obscure_login_errors
 ```
 
-Two other things changed for anything that consumes this package:
+Two other things changed in 2.0.0 for anything that consumes this package. For what changed in
+3.0.0, see [Upgrading to 3.0.0](#upgrading-to-300).
 
 - **`wpuo_boot()` no longer returns a `settings` key.** It returns `['hooks' => [...]]` and nothing
   else.
-- **`wpuo_report()` keeps its five keys and their types.** `oembed` and `login_errors` are now always
-  `true`; `author_probe` is `true` if and only if `author_archives` is `'unused'`.
+- **`wpuo_report()` kept its five keys and their types.** `author_probe` is `true` if and only if
+  `author_archives` is `'unused'`. Two of those types changed again in 3.0.0.
 
 If your site relied on a *ticked* box, you already have that behaviour and more. If it relied on an
 *unticked* box, read the table under [The fail-safe rule](#the-fail-safe-rule-each-declaration-fails-in-the-direction-it-can-afford):
@@ -301,7 +459,7 @@ test by name.
 `site-access` must be must-use: it denies a request before WordPress has finished booting, and a gate
 that can be switched off from the dashboard it protects is not a gate.
 
-Nothing here has that property. All five surfaces are answered on hooks — `rest_pre_dispatch`,
+Nothing here has that property. All five surfaces are answered on hooks — `rest_endpoints`,
 `parse_request`, `template_redirect`, `oembed_response_data`, `authenticate` — and every one of them
 fires long after ordinary plugins have loaded. Must-use placement buys no earlier position.
 
@@ -328,16 +486,19 @@ not yet attached, so a relocated login form stays reachable. There is no equival
 
 ```php
 $report = wpuo_boot();
-// ['hooks' => ['rest_pre_dispatch', 'parse_request', 'oembed_response_data',
+// ['hooks' => ['rest_endpoints', 'parse_request', 'oembed_response_data',
 //              'authenticate', 'shake_error_codes']]
 
 $state = wpuo_report();
-// ['rest_users' => bool, 'author_probe' => bool, 'author_archives' => 'used'|'unused',
-//  'oembed' => true, 'login_errors' => true]
+// ['rest_users' => 'in-force'|'not-in-force'|'unknown'|'declared-used',
+//  'author_probe' => bool, 'author_archives' => 'used'|'unused',
+//  'oembed' => bool, 'login_errors' => bool]
 ```
 
-The boot report lists **hooks, and nothing else**. What is in force is a different question, and
-`wpuo_report()` answers it on demand, from inside a request.
+The boot report lists **hooks, and nothing else, and a hook is not a control** — a production site
+had all five registered correctly while its REST user listing served sixteen login slugs. What is in
+force is a different question, and `wpuo_report()` answers it on demand, from inside a request. See
+[Checking that it is actually in force](#checking-that-it-is-actually-in-force).
 
 ## What this does not achieve
 
@@ -372,6 +533,10 @@ Two smaller consequences worth knowing before you deploy:
 - **A headless front end or an integration that reads `/wp/v2/users` anonymously will get a 401**
   until the site declares `WP_USER_OBSCURE_REST_USERS = 'used'`. That is the intended default, and
   the failure is loud enough to find in the first minute.
+- **Another plugin can still replace the permission callback on those routes** from its own
+  `rest_endpoints` filter, and this plugin would then be inert. That is the one remaining way to lose
+  surface 1, it is the reason `wpuo_report()` reads the live route table rather than its own
+  registration, and it answers `not-in-force` when it has happened.
 
 ## Tests
 
@@ -382,6 +547,17 @@ php tests/run.php
 No WordPress, no database, no network. `tests/bootstrap.php` stubs the small WordPress surface this
 plugin touches, and anything it does not define is a fatal error — which is how "this plugin reads
 nothing" is proved rather than asserted.
+
+**The harness runs the filter chain and dispatches through it**, because the defect 3.0.0 fixes lives
+in the chain and not in a callback. A harness whose `add_filter()` only logs can prove that a callback
+was attached and that it returns the right thing when called directly — which is exactly the evidence
+a production site produced while serving sixteen login slugs.
+`tests/rest-users-enforcement-test.php` puts the careless callbacks in the chain by name: ACF Pro's
+`initialize`, Gravity Forms' `rest_handle_options_request( null, ... )`, and WPML's
+`replace_shortcode_in_rest_request` **because it is correct**, so the file proves the distinction
+rather than a superstition about the hook. It asserts the clobber really happens, then asserts the
+endpoint is refused anyway. **Against 2.0.0 that file fails**, at the refusal, which is the only
+reason it is worth having.
 
 **There is no options table in the harness at all, and that is the central assertion of the suite.**
 `get_option()` and `update_option()` throw unconditionally, in every process, for the whole run. A
@@ -412,3 +588,11 @@ canonical-redirect suppression, the 404 status, the oEmbed `author_url` unset, t
 the memoized boot, the `authenticate` priority, the report's shape — and, for each of the three
 unconditional surfaces, reintroducing a condition, reintroducing a stored value, and reintroducing a
 settings screen.
+
+The 3.0.0 mechanisms were swept the same way, each broken in turn against the whole suite: not
+registering `rest_endpoints` at all, leaving the single-user route unwrapped, wrapping
+`/wp/v2/users/me` which must not be wrapped, replacing the inner permission callback instead of
+wrapping it, answering `null` instead of `true` for a permitted request, dropping the `edit_posts`
+half of the gate, having the enforcement check report `in-force` unconditionally, having the report
+claim a surface without checking it, and putting surface 1 back on `rest_pre_dispatch`. Every one is
+caught, by name, by a file that names the mechanism.

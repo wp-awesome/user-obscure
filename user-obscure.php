@@ -3,7 +3,7 @@
  * Plugin Name: User Obscure
  * Plugin URI:  https://github.com/wp-awesome/user-obscure
  * Description: Removes the five surfaces through which WordPress hands out account names: the REST user listing, ?author=N probing, author archives, oEmbed author fields, and the login form's error message.
- * Version:     2.0.0
+ * Version:     3.0.0
  * Requires PHP: 8.1
  * License:     GPL-2.0-or-later
  *
@@ -13,7 +13,7 @@
  *
  * `site-access` must be must-use: it denies a request before WordPress has finished booting, and a
  * gate that can be switched off from the dashboard it protects is not a gate. Nothing here has that
- * property. All five surfaces are answered on hooks — `rest_pre_dispatch`, `parse_request`,
+ * property. All five surfaces are answered on hooks — `rest_endpoints`, `parse_request`,
  * `template_redirect`, `oembed_response_data`, `authenticate` — and every one of them fires long
  * after ordinary plugins have loaded. Must-use placement would buy no earlier position.
  *
@@ -60,8 +60,10 @@ require_once __DIR__ . '/src/load.php';
  * plugin that failed to load is silent. Memoizing also makes a second `require` harmless instead of
  * a second set of hooks.
  *
- * It lists HOOKS, and nothing else. What is in force is a different question with a different
- * answer, and `wpuo_report()` answers it on demand from inside a request.
+ * It lists HOOKS, and nothing else, and a hook is not a control. A consuming project's production
+ * site had every one of these registered correctly while the REST user listing served sixteen login
+ * slugs. What is IN FORCE is a different question with a different answer, and `wpuo_report()`
+ * answers it on demand from inside a request.
  *
  * @return array{hooks: string[]}
  */
@@ -72,8 +74,12 @@ function wpuo_boot(): array {
 		return $report;
 	}
 
-	// Surface 1. Before dispatch, so the route stays registered and only the answer is gated.
-	add_filter('rest_pre_dispatch', 'wpuo_rest_users_pre_dispatch', 10, 3);
+	// Surface 1. The route's OWN permission callback, wrapped around whatever it already had. The
+	// route stays registered and only the answer is gated, as before — but the decision now lives
+	// somewhere a careless third-party filter has no return value to discard. It was
+	// `rest_pre_dispatch` until 3.0.0, and ACF Pro made it inert on a production site. See
+	// `src/rest-users.php` for the measurement and for why registering later was not the answer.
+	add_filter('rest_endpoints', 'wpuo_rest_users_endpoints', 10, 1);
 
 	// Surfaces 2 and 3. `parse_request` decides; `template_redirect` is attached from there, only for
 	// a request that matched.
@@ -88,7 +94,7 @@ function wpuo_boot(): array {
 
 	$report = [
 		'hooks' => [
-			'rest_pre_dispatch',
+			'rest_endpoints',
 			'parse_request',
 			'oembed_response_data',
 			'authenticate',
